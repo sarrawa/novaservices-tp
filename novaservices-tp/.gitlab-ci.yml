@@ -1,0 +1,78 @@
+# Pipeline GitLab CI/CD : tests > build (+ publication sur main) > déploiement préprod
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+stages:
+  - test
+  - build
+  - deploy
+
+test:
+  stage: test
+  image: python:3.12-slim
+  script:
+    - python -m pip install -r requirements.txt
+    - python -m pytest -q
+
+build:
+  # Merge request : build + contrôle /health, aucune publication
+  # main : idem, puis publication dans le registre GitLab et relevé du digest
+  stage: build
+  image: docker:27.3.1
+  services:
+    - docker:27.3.1-dind
+  variables:
+    DOCKER_HOST: tcp://docker:2376
+    DOCKER_TLS_CERTDIR: "/certs"
+    DOCKER_TLS_VERIFY: "1"
+    DOCKER_CERT_PATH: "/certs/client"
+    IMAGE: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+  script:
+    - apk add --no-cache curl
+    - docker build --build-arg APP_VERSION=$CI_COMMIT_SHA -t $IMAGE .
+    - docker run -d --name app -p 8080:8000 $IMAGE
+    # Le démon Docker tourne dans le service "docker" : on contacte ce hôte, pas localhost
+    - |
+      ok=0
+      for i in $(seq 1 30); do
+        if curl -fsS http://docker:8080/health; then ok=1; break; fi
+        sleep 2
+      done
+      if [ "$ok" != "1" ]; then docker logs app; exit 1; fi
+    - |
+      if [ "$CI_COMMIT_BRANCH" = "$CI_DEFAULT_BRANCH" ]; then
+        echo "$CI_REGISTRY_PASSWORD" | docker login $CI_REGISTRY -u $CI_REGISTRY_USER --password-stdin
+        docker push $IMAGE
+        REF=$(docker inspect --format='{{index .RepoDigests 0}}' $IMAGE)
+        echo "Image publiée : $REF"
+        echo "IMAGE_REF=$REF" > build.env
+      fi
+  artifacts:
+    reports:
+      dotenv: build.env
+
+deploy_preprod:
+  stage: deploy
+  image: alpine:3.20
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  needs:
+    - job: build
+      artifacts: true
+  environment:
+    name: preprod
+  before_script:
+    - apk add --no-cache openssh-client
+    - mkdir -p ~/.ssh
+    # DEPLOY_SSH_KEY : variable de type "File" ; DEPLOY_KNOWN_HOSTS : empreinte fournie par le formateur
+    - cp "$DEPLOY_SSH_KEY" ~/.ssh/id_deploy && chmod 600 ~/.ssh/id_deploy
+    - echo "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+  script:
+    - SSH="ssh -i ~/.ssh/id_deploy -p $DEPLOY_PORT -o StrictHostKeyChecking=yes"
+    - TARGET="$DEPLOY_USER@$DEPLOY_HOST"
+    - scp -i ~/.ssh/id_deploy -P $DEPLOY_PORT deploy.sh "$TARGET:deploy.sh"
+    # La VM s'authentifie au registre avec le jeton du job (valable le temps du job)
+    - echo "$CI_REGISTRY_PASSWORD" | $SSH "$TARGET" "docker login $CI_REGISTRY -u $CI_REGISTRY_USER --password-stdin"
+    - $SSH "$TARGET" "APP_PORT=8080 bash deploy.sh '$IMAGE_REF' '$CI_COMMIT_SHA'"
